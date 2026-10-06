@@ -397,6 +397,7 @@ Environment-specific software, security policies, servicing tools, and Citrix Ap
 
 **Magnus Edholm**  
 AceIQ AB
+
 Solutions Architect  
 Citrix DaaS | Citrix App Layering | WEM | NetScaler | Microsoft Azure
 
