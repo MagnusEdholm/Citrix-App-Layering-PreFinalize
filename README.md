@@ -6,6 +6,22 @@ The script was created from real-world troubleshooting of Citrix App Layering en
 
 > **Important:** Test the script in a non-production environment before using it in production.
 
+
+---
+
+## Current version
+
+**v1.1.0**
+
+### What's new in v1.1.0
+
+- Added automatic Citrix App Layering NGEN `WorkPending` detection
+- Automatically processes queued priority-3 NGEN operations before finalization
+- Handles both 32-bit and 64-bit .NET Framework NGEN queues
+- Detects active `ngen`, `ngentask`, and `mscorsvw` processes
+- Re-checks NGEN state after remediation
+- Prevents false `LAYER LOOKS READY FOR FINALIZE` results when Citrix would still block finalization
+
 ---
 
 ## Why this script exists
