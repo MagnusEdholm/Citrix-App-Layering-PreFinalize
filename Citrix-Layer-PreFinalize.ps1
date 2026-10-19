@@ -4,7 +4,11 @@
 	Author        : Magnus Edholm
 	Email         : magnus.edholm@aceiq.com
 	Website       : www.aceiq.com
-	Date Created  : 2026-10-02 v04.2
+	Date Created  : 2026-10-02
+	Version       : 1.1.0
+	Previous      : v04.2
+	Last Updated  : 2026-10-19
+	Change        : NGEN warning cleanup after successful remediation
 	
 
 .DESCRIPTION
@@ -39,6 +43,9 @@
       - Checks PendingFileRenameOperations
       - Checks common pending reboot indicators
       - Checks for active Windows Installer/MSI activity
+      - Checks Citrix App Layering NGEN WorkPending state
+      - Automatically executes queued priority-3 NGEN work when required
+      - Verifies that no NGEN/MSCORSVW process remains before finalize
       - Displays the current Edge version
       - Cleans safe temporary folders
       - Empties the Recycle Bin
@@ -121,9 +128,10 @@ OPTIONAL SWITCHES
         available. No devices are removed.
 
     -RunNgen
-        Runs ngen.exe update for installed .NET Framework versions.
+        Runs a full ngen.exe update for installed .NET Framework versions.
+        This is separate from the automatic Citrix NGEN queue handling.
         Do not use routinely. Use only when a specific application or vendor
-        requires it.
+        requires a full NGEN update.
 
     -AutoFinalize
         Automatically starts ShutdownForFinalize.cmd if there are no
@@ -165,7 +173,9 @@ IMPORTANT
     - Do not use -StartMaintenance with App or Platform layers.
     - -LayerType defaults to App if omitted.
     - Ghost devices are never removed automatically.
-    - NGEN is disabled by default.
+    - Full NGEN rebuild (-RunNgen) is disabled by default.
+    - Citrix-required queued NGEN work (WorkPending / priority 3) is handled
+      automatically before finalize.
     - Event Logs are not cleared.
     - SoftwareDistribution is not cleared.
     - Edge Update policies/services/tasks are only modified persistently in
@@ -596,6 +606,154 @@ function Invoke-SafeCleanup {
         catch {
             Write-Warn "Could not flush the DNS cache."
         }
+    }
+}
+
+
+function Get-CitrixNgenWorkPending {
+    $locations = @(
+        [PSCustomObject]@{
+            Name = '64-bit registry view'
+            Path = 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v2.0.50727\NGenService\Roots'
+        },
+        [PSCustomObject]@{
+            Name = '32-bit registry view'
+            Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v2.0.50727\NGenService\Roots'
+        }
+    )
+
+    $results = @()
+
+    foreach ($location in $locations) {
+        $value = 0
+        $exists = Test-Path $location.Path
+
+        if ($exists) {
+            try {
+                $rawValue = Get-ItemPropertyValue `
+                    -Path $location.Path `
+                    -Name 'WorkPending' `
+                    -ErrorAction SilentlyContinue
+
+                if ($null -ne $rawValue) {
+                    $value = [int]$rawValue
+                }
+            }
+            catch {
+                $value = 0
+            }
+        }
+
+        $results += [PSCustomObject]@{
+            Name        = $location.Name
+            Path        = $location.Path
+            KeyExists   = $exists
+            WorkPending = $value
+        }
+    }
+
+    return $results
+}
+
+function Get-ActiveNgenProcesses {
+    return @(
+        Get-Process -Name ngen,ngentask,mscorsvw -ErrorAction SilentlyContinue |
+        Select-Object ProcessName,Id,CPU,StartTime
+    )
+}
+
+function Resolve-CitrixNgenQueue {
+    Write-Section "Citrix App Layering - NGEN Integrity Check"
+
+    $activeBefore = @(Get-ActiveNgenProcesses)
+
+    if ($activeBefore.Count -gt 0) {
+        Write-Warn "An NGEN/MSCORSVW operation is already running."
+        $activeBefore | Format-Table -AutoSize
+        Write-Fail "NGEN is currently in progress. Allow it to finish, then run the script again. Do not reboot or terminate NGEN while it is actively compiling."
+        return
+    }
+
+    $pendingBefore = @(Get-CitrixNgenWorkPending)
+    $needsWork = @($pendingBefore | Where-Object { $_.WorkPending -gt 0 })
+
+    foreach ($item in $pendingBefore) {
+        if ($item.WorkPending -gt 0) {
+            Write-Info "$($item.Name): NGEN WorkPending = $($item.WorkPending) - remediation required"
+        }
+        else {
+            Write-Pass "$($item.Name): NGEN WorkPending = 0"
+        }
+    }
+
+    if ($needsWork.Count -eq 0) {
+        Write-Pass "No Citrix-blocking NGEN priority-3 work is pending."
+        return
+    }
+
+    Write-Info "Citrix-required NGEN work is pending. Executing queued priority-3 items."
+
+    $ngenTargets = @(
+        'C:\Windows\Microsoft.NET\Framework\v4.0.30319\ngen.exe',
+        'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\ngen.exe'
+    )
+
+    $ranAtLeastOne = $false
+
+    foreach ($ngenExe in $ngenTargets) {
+        if (-not (Test-Path $ngenExe)) {
+            Write-Info "NGEN executable not found, skipping: $ngenExe"
+            continue
+        }
+
+        $ranAtLeastOne = $true
+
+        try {
+            Write-Info "Running: `"$ngenExe`" eqi 3"
+            & $ngenExe eqi 3
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Pass "NGEN priority-3 queue completed: $ngenExe"
+            }
+            else {
+                Write-Fail "NGEN returned exit code $($LASTEXITCODE): $ngenExe"
+            }
+        }
+        catch {
+            Write-Fail "NGEN failed for $ngenExe : $($_.Exception.Message)"
+        }
+    }
+
+    if (-not $ranAtLeastOne) {
+        Write-Fail "NGEN WorkPending is set, but no supported .NET Framework v4 NGEN executable was found."
+        return
+    }
+
+    Write-Info "Waiting 12 seconds for NGEN/Citrix integrity state to update..."
+    Start-Sleep -Seconds 12
+
+    $activeAfter = @(Get-ActiveNgenProcesses)
+    if ($activeAfter.Count -gt 0) {
+        Write-Warn "NGEN/MSCORSVW is still active after processing."
+        $activeAfter | Format-Table -AutoSize
+        Write-Fail "NGEN is still in progress. Wait for it to finish and rerun the script before finalizing."
+        return
+    }
+
+    $pendingAfter = @(Get-CitrixNgenWorkPending)
+    $stillPending = @($pendingAfter | Where-Object { $_.WorkPending -gt 0 })
+
+    foreach ($item in $pendingAfter) {
+        if ($item.WorkPending -gt 0) {
+            Write-Fail "$($item.Name): NGEN WorkPending is still $($item.WorkPending). Citrix Shutdown for Finalize may remain blocked."
+        }
+        else {
+            Write-Pass "$($item.Name): NGEN WorkPending = 0 after processing."
+        }
+    }
+
+    if ($stillPending.Count -eq 0) {
+        Write-Pass "Citrix NGEN integrity requirement is satisfied."
     }
 }
 
@@ -1079,6 +1237,7 @@ function Verify-OSLayerEdgeMaintenance {
 # ------------------------------------------------------------------
 
 Write-Section "Citrix App Layering Pre-Finalize - Windows Server 2022"
+Write-Host "          Version    : 1.1.1" -ForegroundColor White
 Write-Host "          Layer type : $LayerType" -ForegroundColor White
 if ($LayerType -eq 'OS') {
     Write-Host "          Edge mode  : OS maintenance protection" -ForegroundColor White
@@ -1153,6 +1312,7 @@ Show-EdgeVersion
 Report-GhostDevices
 Invoke-SafeCleanup
 Invoke-OptionalNgen
+Resolve-CitrixNgenQueue
 Verify-OSLayerEdgeMaintenance
 
 Write-Section "FINAL RESULT"
