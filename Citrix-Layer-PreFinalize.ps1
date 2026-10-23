@@ -5,10 +5,9 @@
 	Email         : magnus.edholm@aceiq.com
 	Website       : www.aceiq.com
 	Date Created  : 2026-10-02
-	Version       : 1.1.0
-	Previous      : v04.2
-	Last Updated  : 2026-10-19
-	Change        : NGEN warning cleanup after successful remediation
+	Version       : 1.2.0
+	Last Updated  : 2026-10-22
+	Change        : Platform Layer integrity checks for FSLogix and Citrix WEM
 	
 
 .DESCRIPTION
@@ -716,7 +715,8 @@ function Resolve-CitrixNgenQueue {
                 Write-Pass "NGEN priority-3 queue completed: $ngenExe"
             }
             else {
-                Write-Fail "NGEN returned exit code $($LASTEXITCODE): $ngenExe"
+                Write-Info "NGEN returned exit code $($LASTEXITCODE): $ngenExe"
+                Write-Info "The final WorkPending state will determine whether this is blocking. Architecture-specific assemblies can cause a non-zero exit code during a mixed queue."
             }
         }
         catch {
@@ -754,6 +754,169 @@ function Resolve-CitrixNgenQueue {
 
     if ($stillPending.Count -eq 0) {
         Write-Pass "Citrix NGEN integrity requirement is satisfied."
+    }
+}
+
+
+function Test-PlatformLayerFSLogix {
+    Write-Section "Platform Layer - FSLogix Integrity Check"
+
+    $servicePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\frxdrvvt'
+    $instancePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\frxdrvvt\Instances\frxdrvvt'
+    $requiredAltitude = '138010'
+
+    if (-not (Test-Path $servicePath)) {
+        Write-Info "FSLogix frxdrvvt driver is not installed. No FSLogix altitude check is required."
+        return
+    }
+
+    Write-Info "FSLogix frxdrvvt driver detected."
+
+    if (-not (Test-Path $instancePath)) {
+        Write-Fail "FSLogix is installed, but the expected frxdrvvt instance registry path does not exist: $instancePath"
+        return
+    }
+
+    $currentAltitude = $null
+    try {
+        $currentAltitude = [string](Get-ItemPropertyValue -Path $instancePath -Name 'Altitude' -ErrorAction Stop)
+    }
+    catch {
+        Write-Info "FSLogix Altitude value is missing. Remediation is required."
+    }
+
+    if ($currentAltitude -eq $requiredAltitude) {
+        Write-Pass "FSLogix frxdrvvt altitude = $requiredAltitude."
+        return
+    }
+
+    if ($currentAltitude) {
+        Write-Info "FSLogix frxdrvvt altitude is '$currentAltitude'. Required value is '$requiredAltitude'."
+    }
+
+    try {
+        New-ItemProperty -Path $instancePath -Name 'Altitude' -PropertyType String -Value $requiredAltitude -Force -ErrorAction Stop | Out-Null
+        Write-Pass "FSLogix frxdrvvt altitude corrected to $requiredAltitude."
+    }
+    catch {
+        Write-Fail "Could not set FSLogix frxdrvvt altitude to $requiredAltitude : $($_.Exception.Message)"
+        return
+    }
+
+    try {
+        $verifyAltitude = [string](Get-ItemPropertyValue -Path $instancePath -Name 'Altitude' -ErrorAction Stop)
+        if ($verifyAltitude -eq $requiredAltitude) {
+            Write-Pass "Verified FSLogix frxdrvvt altitude = $requiredAltitude."
+        }
+        else {
+            Write-Fail "FSLogix altitude verification failed. Current value: '$verifyAltitude'."
+        }
+    }
+    catch {
+        Write-Fail "Could not verify FSLogix altitude after remediation: $($_.Exception.Message)"
+    }
+}
+
+function Remove-PlatformLayerWemRsaKey {
+    Write-Section "Platform Layer - Citrix WEM RSA Key Check"
+
+    $rsaPath = 'C:\ProgramData\Microsoft\Crypto\RSA\S-1-5-18'
+    $wemKeyPrefix = 'fb8cc9e38d3e60ab60c17cdfd6dd6d99_'
+
+    if (-not (Test-Path -LiteralPath $rsaPath)) {
+        Write-Pass "RSA machine-key path is not present. No Citrix WEM RSA cleanup is required."
+        return
+    }
+
+    $matchingKeys = @(
+        Get-ChildItem -LiteralPath $rsaPath -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "$wemKeyPrefix*" }
+    )
+
+    if ($matchingKeys.Count -eq 0) {
+        Write-Pass "No Citrix WEM RSA key matching '$wemKeyPrefix*' was found."
+        return
+    }
+
+    Write-Info "Found $($matchingKeys.Count) Citrix WEM RSA key file(s) that must not be present when finalizing the Platform Layer."
+
+    foreach ($keyFile in $matchingKeys) {
+        Write-Info "Removing WEM RSA key: $($keyFile.FullName)"
+        try {
+            Remove-Item -LiteralPath $keyFile.FullName -Force -ErrorAction Stop
+            Write-Pass "Removed WEM RSA key: $($keyFile.Name)"
+        }
+        catch {
+            Write-Fail "Could not remove WEM RSA key '$($keyFile.FullName)': $($_.Exception.Message)"
+        }
+    }
+
+    $remainingKeys = @(
+        Get-ChildItem -LiteralPath $rsaPath -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "$wemKeyPrefix*" }
+    )
+
+    if ($remainingKeys.Count -eq 0) {
+        Write-Pass "Verified that no Citrix WEM RSA key files remain."
+    }
+    else {
+        Write-Fail "$($remainingKeys.Count) Citrix WEM RSA key file(s) still remain after cleanup."
+        foreach ($keyFile in $remainingKeys) {
+            Write-Host "          $($keyFile.FullName)" -ForegroundColor Red
+        }
+    }
+}
+
+function Test-PlatformLayerIntegrity {
+    if ($LayerType -ne 'Platform') {
+        return
+    }
+
+    Write-Section "Platform Layer - Citrix-Specific Integrity Checks"
+    Write-Info "Running Platform Layer-specific checks before finalization."
+
+    Test-PlatformLayerFSLogix
+    Remove-PlatformLayerWemRsaKey
+
+    Write-Section "Platform Layer - Final Integrity Verification"
+
+    $servicePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\frxdrvvt'
+    $instancePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\frxdrvvt\Instances\frxdrvvt'
+
+    if (Test-Path $servicePath) {
+        try {
+            $altitude = [string](Get-ItemPropertyValue -Path $instancePath -Name 'Altitude' -ErrorAction Stop)
+            if ($altitude -eq '138010') {
+                Write-Pass "FSLogix altitude verification passed: 138010."
+            }
+            else {
+                Write-Fail "FSLogix altitude is '$altitude'; expected 138010."
+            }
+        }
+        catch {
+            Write-Fail "FSLogix is installed but altitude could not be verified."
+        }
+    }
+    else {
+        Write-Info "FSLogix frxdrvvt driver is not installed."
+    }
+
+    $rsaPath = 'C:\ProgramData\Microsoft\Crypto\RSA\S-1-5-18'
+    $wemKeyPrefix = 'fb8cc9e38d3e60ab60c17cdfd6dd6d99_'
+    $remainingKeys = @()
+
+    if (Test-Path -LiteralPath $rsaPath) {
+        $remainingKeys = @(
+            Get-ChildItem -LiteralPath $rsaPath -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "$wemKeyPrefix*" }
+        )
+    }
+
+    if ($remainingKeys.Count -eq 0) {
+        Write-Pass "Citrix WEM RSA key verification passed."
+    }
+    else {
+        Write-Fail "Citrix WEM RSA key is still present."
     }
 }
 
@@ -1237,7 +1400,7 @@ function Verify-OSLayerEdgeMaintenance {
 # ------------------------------------------------------------------
 
 Write-Section "Citrix App Layering Pre-Finalize - Windows Server 2022"
-Write-Host "          Version    : 1.1.1" -ForegroundColor White
+Write-Host "          Version    : 1.2.0" -ForegroundColor White
 Write-Host "          Layer type : $LayerType" -ForegroundColor White
 if ($LayerType -eq 'OS') {
     Write-Host "          Edge mode  : OS maintenance protection" -ForegroundColor White
@@ -1313,6 +1476,7 @@ Report-GhostDevices
 Invoke-SafeCleanup
 Invoke-OptionalNgen
 Resolve-CitrixNgenQueue
+Test-PlatformLayerIntegrity
 Verify-OSLayerEdgeMaintenance
 
 Write-Section "FINAL RESULT"
