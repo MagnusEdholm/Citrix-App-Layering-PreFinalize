@@ -5,9 +5,9 @@
 	Email         : magnus.edholm@aceiq.com
 	Website       : www.aceiq.com
 	Date Created  : 2026-10-02
-	Version       : 1.2.0
-	Last Updated  : 2026-10-22
-	Change        : Platform Layer integrity checks for FSLogix and Citrix WEM
+	Version       : 1.3.0
+	Last Updated  : 2026-10-23
+	Change        : Conditional OS Layer OneDrive maintenance and finalize safety
 	
 
 .DESCRIPTION
@@ -181,6 +181,18 @@ IMPORTANT
       OS Layer mode.
 #>
 
+<#
+.VERSION 1.3.0 ONEDRIVE NOTES
+    OS Layers only, and only when an installed OneDrive client is detected.
+    Finalize sets Deferred only if no update ring policy exists; preserves existing policies.
+    StartMaintenance removes only this script's unchanged Deferred override.
+    Never disables OneDrive tasks/services, blocks endpoints, or force-kills installers.
+    Close OneDrive and finish updates before finalize. Active client/setup/updater
+    processes block finalize. Deferred does not guarantee an update-free capture.
+    -NoShutdown still applies finalize settings, as in v1.2.0; it is not read-only.
+    Existing Edge, NGEN, Platform/FSLogix/WEM and cleanup behavior is retained.
+#>
+
 [CmdletBinding()]
 param(
     [ValidateSet('OS','App','Platform')]
@@ -223,6 +235,121 @@ try {
 }
 catch {
     Write-Warning "Could not start transcript: $($_.Exception.Message)"
+}
+
+
+# OneDrive v1.3.0: supported ring policy; no task/service suppression or forced kill.
+# https://learn.microsoft.com/en-us/sharepoint/use-group-policy#set-the-sync-app-update-ring
+# https://learn.microsoft.com/en-us/sharepoint/sync-client-update-process
+# Deferred is NOT an update freeze. Keep the packaging VM idle during capture.
+$script:OneDriveDetected = $false
+
+function Initialize-OSLayerOneDrive {
+    if ($LayerType -ne 'OS') { return }
+    Write-Section "OS Layer - OneDrive Detection"
+    try {
+        # An inbox OneDriveSetup.exe alone is not an installed sync client.
+        $roots = @(
+            "$env:ProgramFiles\Microsoft OneDrive",
+            "${env:ProgramFiles(x86)}\Microsoft OneDrive"
+        )
+        $profiles = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' -ErrorAction Stop)
+        foreach ($profile in $profiles) {
+            if ($profile.ProfileImagePath) {
+                $homePath = [Environment]::ExpandEnvironmentVariables($profile.ProfileImagePath)
+                $roots += Join-Path $homePath 'AppData\Local\Microsoft\OneDrive'
+            }
+        }
+        foreach ($root in @($roots | Select-Object -Unique)) {
+            $exe = Join-Path $root 'OneDrive.exe'
+            if (Test-Path -LiteralPath $exe -PathType Leaf -ErrorAction Stop) {
+                $script:OneDriveDetected = $true
+                Write-Info "Installed OneDrive client: $exe"
+            }
+        }
+        # Covers running clients outside the usual installation locations.
+        $clients = @(Get-CimInstance Win32_Process -Filter "Name='OneDrive.exe'" -ErrorAction Stop)
+        if ($clients.Count -gt 0) { $script:OneDriveDetected = $true }
+        if (-not $script:OneDriveDetected) {
+            Write-Info 'OneDrive is not installed - skipping OneDrive handling.'
+        }
+    }
+    catch {
+        Write-Fail "OneDrive detection could not complete safely: $($_.Exception.Message)"
+    }
+}
+
+function Set-OSLayerOneDriveMode {
+    if ($LayerType -ne 'OS' -or -not $script:OneDriveDetected) { return }
+    Write-Section 'OS Layer - OneDrive Update Policy'
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
+    $statePath = 'HKLM:\SOFTWARE\CitrixLayerPreFinalize\OneDrive'
+    try {
+        $ring = $null
+        if (Test-Path $policyPath) {
+            $ring = (Get-ItemProperty $policyPath -ErrorAction Stop).PSObject.Properties['GPOSetUpdateRing']
+        }
+        $owned = $false
+        if (Test-Path $statePath) {
+            $marker = (Get-ItemProperty $statePath -ErrorAction Stop).PSObject.Properties['ManagedDeferred']
+            $owned = ($null -ne $marker -and $marker.Value -eq 1)
+        }
+        if ($StartMaintenance) {
+            # Remove only our own unchanged Deferred override. Existing policies win.
+            if ($owned -and $null -ne $ring -and $ring.Value -eq 0) {
+                Remove-ItemProperty $policyPath -Name GPOSetUpdateRing -ErrorAction Stop
+                $check = (Get-ItemProperty $policyPath -ErrorAction Stop).PSObject.Properties['GPOSetUpdateRing']
+                if ($null -ne $check) { throw 'Could not remove script-managed ring policy.' }
+                Write-Pass 'Removed script-managed Deferred override; default ring is Production unless managed externally.'
+            }
+            if ($owned) { Remove-ItemProperty $statePath -Name ManagedDeferred -ErrorAction Stop }
+            Write-Info 'OneDrive update tasks and services are left available. Update OneDrive and reboot as required.'
+        }
+        elseif ($null -eq $ring) {
+            # Persist ownership first so a partially completed operation is recoverable.
+            New-Item $statePath -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty $statePath -Name ManagedDeferred -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null
+            New-Item $policyPath -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty $policyPath -Name GPOSetUpdateRing -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+            $actual = Get-ItemProperty $policyPath -ErrorAction Stop
+            if ($actual.GPOSetUpdateRing -ne 0) { throw 'Deferred policy verification failed.' }
+            Write-Pass 'OneDrive update ring = Deferred (0). This does not disable updates.'
+        }
+        else {
+            Write-Info "Preserving existing OneDrive GPOSetUpdateRing=$($ring.Value)."
+            if ($ring.Value -notin @(0,4,5)) { Write-Warn 'Unrecognized OneDrive update ring; review the effective policy.' }
+        }
+        # Inspect actual actions, not localized or version-dependent task names.
+        $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+            @($_.Actions | Where-Object {
+                ($null -ne $_.PSObject.Properties['Execute']) -and
+                ($_.Execute -match '(?i)(^|[\\/"])OneDriveStandaloneUpdater\.exe"?$')
+            }).Count -gt 0
+        })
+        foreach ($task in $tasks) {
+            Write-Info "OneDrive updater task: $($task.TaskPath)$($task.TaskName), state=$($task.State) (unchanged)."
+            if ($task.State -eq 'Disabled') {
+                Write-Warn 'OneDrive updater task was already disabled; review its owner and re-enable through your management system for maintenance.'
+            }
+        }
+        if ($tasks.Count -eq 0) { Write-Info 'No standalone updater task action found; the sync client can still update itself.' }
+    }
+    catch { Write-Fail "OneDrive update-policy handling failed: $($_.Exception.Message)" }
+}
+
+function Test-OSLayerOneDriveIdle {
+    if ($LayerType -ne 'OS' -or -not $script:OneDriveDetected) { return }
+    Write-Section 'OS Layer - OneDrive Finalize Safety'
+    try {
+        # Never terminate an installer mid-update. A running sync client can start
+        # its own update, so it must also be closed before capture.
+        $busy = @(Get-CimInstance Win32_Process -Filter "Name='OneDrive.exe' OR Name='OneDriveStandaloneUpdater.exe' OR Name='OneDriveSetup.exe'" -ErrorAction Stop)
+        foreach ($process in $busy) {
+            Write-Fail "OneDrive activity blocks finalize: $($process.Name) PID $($process.ProcessId). Finish updates and close OneDrive, then rerun."
+        }
+        if ($busy.Count -eq 0) { Write-Pass 'No OneDrive sync client, standalone updater or setup process is running at this check.' }
+    }
+    catch { Write-Fail "Could not verify OneDrive process state: $($_.Exception.Message)" }
 }
 
 function Write-Section {
@@ -1004,6 +1131,12 @@ function Invoke-Finalize {
     if ($runFinalize) {
         Write-Host ""
         Write-Host "Starting Shutdown for Finalize..." -ForegroundColor Green
+        # Recheck after interactive confirmation and immediately before handoff.
+        Test-OSLayerOneDriveIdle
+        if ($script:Errors.Count -gt 0) {
+            Write-Info 'Finalize blocked by safety checks.'
+            return
+        }
         & $finalizeCmd
     }
     else {
@@ -1400,7 +1533,7 @@ function Verify-OSLayerEdgeMaintenance {
 # ------------------------------------------------------------------
 
 Write-Section "Citrix App Layering Pre-Finalize - Windows Server 2022"
-Write-Host "          Version    : 1.2.0" -ForegroundColor White
+Write-Host "          Version    : 1.3.0" -ForegroundColor White
 Write-Host "          Layer type : $LayerType" -ForegroundColor White
 if ($LayerType -eq 'OS') {
     Write-Host "          Edge mode  : OS maintenance protection" -ForegroundColor White
@@ -1434,6 +1567,8 @@ if ($StartMaintenance) {
     }
 
     [void](Start-OSLayerMaintenance)
+    Initialize-OSLayerOneDrive
+    Set-OSLayerOneDriveMode
 
     Write-Section "FINAL RESULT"
 
@@ -1464,6 +1599,8 @@ if ($StartMaintenance) {
     exit $exitCode
 }
 
+Initialize-OSLayerOneDrive
+Set-OSLayerOneDriveMode
 Check-Firewall
 Configure-OSLayerEdgeMaintenance
 Stop-EdgeUpdateProcesses
@@ -1478,6 +1615,7 @@ Invoke-OptionalNgen
 Resolve-CitrixNgenQueue
 Test-PlatformLayerIntegrity
 Verify-OSLayerEdgeMaintenance
+Test-OSLayerOneDriveIdle
 
 Write-Section "FINAL RESULT"
 
